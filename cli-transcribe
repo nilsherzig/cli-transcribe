@@ -4,7 +4,7 @@ set -Eeuo pipefail
 PROGRAM_NAME="${0##*/}"
 MODEL_NAME="large-v3-turbo-q8_0"
 MODEL_FILE="ggml-${MODEL_NAME}.bin"
-MODEL_DIR="${HOME}/.local/share/transcribe"
+MODEL_DIR="${HOME}/.local/share/cli-transcribe"
 DEFAULT_LANG="de"
 
 lang="$DEFAULT_LANG"
@@ -222,7 +222,7 @@ record_audio() {
   log "Aufnahme gespeichert: $audio_file"
 }
 
-transcribe_audio() {
+run_transcription() {
   local model_path="$1"
   local audio_file="$2"
   local output_base="$3"
@@ -309,7 +309,7 @@ main() {
 
   log "Temporärer Arbeitsordner: $work_dir"
   record_audio "$selected_mic" "$audio_file"
-  transcript_file="$(transcribe_audio "$model_path" "$audio_file" "$output_base")"
+  transcript_file="$(run_transcription "$model_path" "$audio_file" "$output_base")"
 
   if [[ "$copy_to_clipboard" == true ]]; then
     wl-copy < "$transcript_file"

@@ -32,7 +32,7 @@
               whisper-cpp-vulkan
               wl-clipboard
             ];
-            text = builtins.readFile ./transcribe.sh;
+            text = builtins.readFile ./cli-transcribe;
           };
         });
 
