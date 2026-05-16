@@ -1,5 +1,6 @@
 > [!WARNING]  
 > AI Slop
+> also there is `whisper-stream` which can do live transcripts, but its kinda broken for me. But might be worth looking into.
 
 # cli-transcribe
 
