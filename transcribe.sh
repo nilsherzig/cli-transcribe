@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROGRAM_NAME="${0##*/}"
+MODEL_NAME="large-v3-turbo-q8_0"
+MODEL_FILE="ggml-${MODEL_NAME}.bin"
+MODEL_DIR="${HOME}/.local/share/transcribe"
+DEFAULT_LANG="de"
+
+lang="$DEFAULT_LANG"
+mic=""
+copy_to_clipboard=false
+verbose=false
+
+log() {
+  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+}
+
+info() {
+  printf '%s\n' "$*" >&2
+}
+
+die() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+$PROGRAM_NAME - Audio aufnehmen und mit whisper.cpp transkribieren
+
+Usage:
+  $PROGRAM_NAME [OPTIONS]
+  $PROGRAM_NAME --list-mics
+  $PROGRAM_NAME help
+
+Options:
+  --mic <pulse-source>  Mikrofon/PulseAudio-Source direkt oder als Teilstring angeben.
+                        Beispiel: --mic "rode" matcht wie *rode*.
+                        Wenn mehrere Mikrofone matchen, bricht das Programm mit Erklärung ab.
+                        Ohne diese Option wird eine Auswahl mit fzf geöffnet.
+  --lang <lang>         Sprache für Whisper, Default: de
+                        Beispiele: de, en, fr, auto
+  --copy                Transcript nach Erstellung mit wl-copy in die Zwischenablage kopieren.
+  -v, --verbose         Ausführliche Ausgaben von ffmpeg und whisper-cli anzeigen.
+  --list-mics           Verfügbare Mikrofone auflisten. Die ausgegebenen Namen können für --mic genutzt werden.
+  -h, --help            Diese Hilfe anzeigen.
+
+Examples:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --mic alsa_input.pci-0000_0b_00.4.analog-stereo --lang de
+  $PROGRAM_NAME --mic rode --copy
+  $PROGRAM_NAME --copy
+  $PROGRAM_NAME --list-mics
+
+Ablauf:
+  1. Falls das Whisper-Model fehlt, wird es nach $MODEL_DIR heruntergeladen.
+  2. Du wählst ein Mikrofon aus oder gibst es via --mic an.
+  3. ffmpeg nimmt auf, bis du Enter/Return drückst.
+  4. whisper-cli transkribiert die Aufnahme.
+  5. Das Transcript wird auf stdout ausgegeben.
+     Script-Logs werden auf stderr ausgegeben.
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1"
+}
+
+list_mics() {
+  require_command pactl
+  pactl list short sources | awk '$2 !~ /\.monitor$/ { print $2 }'
+}
+
+ensure_model() {
+  local model_path="$MODEL_DIR/$MODEL_FILE"
+
+  if [[ -f "$model_path" ]]; then
+    log "Whisper-Model gefunden: $model_path"
+    printf '%s\n' "$model_path"
+    return 0
+  fi
+
+  require_command whisper-cpp-download-ggml-model
+
+  info "Whisper-Model fehlt: $model_path"
+  info "Lade Model '$MODEL_NAME' nach $MODEL_DIR herunter. Das kann eine Weile dauern ..."
+  mkdir -p "$MODEL_DIR"
+  (
+    cd "$MODEL_DIR"
+    whisper-cpp-download-ggml-model "$MODEL_NAME"
+  ) >&2
+
+  [[ -f "$model_path" ]] || die "Model wurde nicht unter $model_path gefunden. Bitte Download-Ausgabe prüfen."
+  info "Download abgeschlossen: $model_path"
+  printf '%s\n' "$model_path"
+}
+
+resolve_mic_query() {
+  local query="$1"
+  local -a exact_matches substring_matches
+
+  mapfile -t exact_matches < <(list_mics | grep -Fxi -- "$query" || true)
+  if [[ ${#exact_matches[@]} -eq 1 ]]; then
+    printf '%s\n' "${exact_matches[0]}"
+    return 0
+  fi
+
+  mapfile -t substring_matches < <(list_mics | grep -Fi -- "$query" || true)
+  case "${#substring_matches[@]}" in
+    0)
+      die "Kein Mikrofon matcht --mic '$query' (*$query*). Nutze --list-mics für gültige Werte."
+      ;;
+    1)
+      log "--mic '$query' wurde auf '${substring_matches[0]}' aufgelöst."
+      printf '%s\n' "${substring_matches[0]}"
+      ;;
+    *)
+      {
+        printf 'Error: --mic '\''%s'\'' ist nicht eindeutig. Folgende Mikrofone matchen *%s*:\n' "$query" "$query"
+        printf '  %s\n' "${substring_matches[@]}"
+        printf 'Bitte nutze einen genaueren Suchbegriff oder einen vollständigen Namen aus --list-mics.\n'
+      } >&2
+      exit 1
+      ;;
+  esac
+}
+
+select_mic() {
+  if [[ -n "$mic" ]]; then
+    resolve_mic_query "$mic"
+    return 0
+  fi
+
+  require_command fzf
+
+  local selected
+  selected="$(list_mics | fzf --prompt='Mikrofon auswählen: ' --height=40% --border)" || die "Keine Mikrofon-Auswahl getroffen."
+  [[ -n "$selected" ]] || die "Keine Mikrofon-Auswahl getroffen."
+  printf '%s\n' "$selected"
+}
+
+validate_mic() {
+  local selected="$1"
+  list_mics | grep -Fx -- "$selected" >/dev/null || die "Mikrofon nicht gefunden: $selected. Nutze --list-mics für gültige Werte."
+}
+
+record_audio() {
+  local selected_mic="$1"
+  local audio_file="$2"
+
+  log "Aufnahme startet über Mikrofon: $selected_mic"
+  info "Aufnahme läuft. Drücke Enter/Return zum Beenden oder Ctrl-C zum Abbrechen."
+
+  local ffmpeg_loglevel="error"
+  if [[ "$verbose" == true ]]; then
+    ffmpeg_loglevel="warning"
+  fi
+
+  ffmpeg -hide_banner -loglevel "$ffmpeg_loglevel" -y \
+    -f pulse -i "$selected_mic" \
+    -ac 1 -ar 16000 -c:a pcm_s16le \
+    "$audio_file" < /dev/null &
+
+  local ffmpeg_pid=$!
+
+  stop_recording() {
+    local signal="${1:-INT}"
+    if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
+      wait "$ffmpeg_pid" >/dev/null 2>&1 || true
+      return 0
+    fi
+
+    kill -"$signal" "$ffmpeg_pid" >/dev/null 2>&1 || true
+
+    # Nicht unbegrenzt auf ffmpeg warten: PulseAudio/ffmpeg kann bei SIGINT hängen.
+    for _ in {1..20}; do
+      if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
+        wait "$ffmpeg_pid" >/dev/null 2>&1 || true
+        return 0
+      fi
+      sleep 0.1
+    done
+
+    log "ffmpeg reagiert nicht auf SIG$signal, sende SIGTERM ..."
+    kill -TERM "$ffmpeg_pid" >/dev/null 2>&1 || true
+    for _ in {1..10}; do
+      if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
+        wait "$ffmpeg_pid" >/dev/null 2>&1 || true
+        return 0
+      fi
+      sleep 0.1
+    done
+
+    log "ffmpeg reagiert nicht auf SIGTERM, sende SIGKILL ..."
+    kill -KILL "$ffmpeg_pid" >/dev/null 2>&1 || true
+    for _ in {1..10}; do
+      if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
+        wait "$ffmpeg_pid" >/dev/null 2>&1 || true
+        return 0
+      fi
+      sleep 0.1
+    done
+  }
+
+  abort_recording() {
+    trap - INT TERM
+    printf '\n' >&2
+    log "Abbruch angefordert. Stoppe Aufnahme und beende Programm ..."
+    stop_recording INT
+    exit 130
+  }
+
+  trap abort_recording INT TERM
+
+  read -r _ < /dev/tty || true
+
+  stop_recording INT
+  trap - INT TERM
+
+  [[ -s "$audio_file" ]] || die "Aufnahme-Datei ist leer oder wurde nicht erstellt: $audio_file"
+  log "Aufnahme gespeichert: $audio_file"
+}
+
+transcribe_audio() {
+  local model_path="$1"
+  local audio_file="$2"
+  local output_base="$3"
+  local transcript_file="${output_base}.txt"
+
+  log "Transkribiere mit whisper-cli, Sprache: $lang"
+  if [[ "$verbose" == true ]]; then
+    whisper-cli \
+      -m "$model_path" \
+      -f "$audio_file" \
+      -l "$lang" \
+      -otxt \
+      -of "$output_base" \
+      -nt >&2 || die "whisper-cli ist fehlgeschlagen."
+  else
+    whisper-cli \
+      -m "$model_path" \
+      -f "$audio_file" \
+      -l "$lang" \
+      -otxt \
+      -of "$output_base" \
+      -nt >/dev/null 2>&1 || die "whisper-cli ist fehlgeschlagen. Nutze -v für Details."
+  fi
+
+  [[ -f "$transcript_file" ]] || die "Transcript wurde nicht erstellt: $transcript_file"
+  log "Transcript gespeichert: $transcript_file"
+  printf '%s\n' "$transcript_file"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      help|-h|--help)
+        usage
+        exit 0
+        ;;
+      --list-mics|list-mics)
+        list_mics
+        exit 0
+        ;;
+      --mic)
+        [[ $# -ge 2 ]] || die "--mic benötigt einen Wert."
+        mic="$2"
+        shift 2
+        ;;
+      --lang)
+        [[ $# -ge 2 ]] || die "--lang benötigt einen Wert."
+        lang="$2"
+        shift 2
+        ;;
+      --copy)
+        copy_to_clipboard=true
+        shift
+        ;;
+      -v|--verbose)
+        verbose=true
+        shift
+        ;;
+      *)
+        die "Unbekannte Option: $1. Nutze --help."
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+
+  require_command ffmpeg
+  require_command whisper-cli
+  require_command pactl
+  if [[ "$copy_to_clipboard" == true ]]; then
+    require_command wl-copy
+  fi
+
+  local model_path selected_mic work_dir audio_file output_base transcript_file
+  model_path="$(ensure_model)"
+  selected_mic="$(select_mic)"
+  validate_mic "$selected_mic"
+
+  work_dir="$(mktemp -d -t cli-transcribe.XXXXXX)"
+  audio_file="$work_dir/audio.wav"
+  output_base="$work_dir/transcript"
+
+  log "Temporärer Arbeitsordner: $work_dir"
+  record_audio "$selected_mic" "$audio_file"
+  transcript_file="$(transcribe_audio "$model_path" "$audio_file" "$output_base")"
+
+  if [[ "$copy_to_clipboard" == true ]]; then
+    wl-copy < "$transcript_file"
+    log "Transcript wurde in die Zwischenablage kopiert."
+  fi
+
+  cat "$transcript_file"
+}
+
+main "$@"
