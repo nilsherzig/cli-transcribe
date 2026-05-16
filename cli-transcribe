@@ -235,6 +235,8 @@ run_transcription() {
       -f "$audio_file" \
       -l "$lang" \
       -otxt \
+      --print-colors \
+      --print-confidence \
       -of "$output_base" \
       -nt >&2 || die "whisper-cli ist fehlgeschlagen."
   else
