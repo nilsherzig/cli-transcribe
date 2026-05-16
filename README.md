@@ -1,3 +1,6 @@
+> [!WARNING]  
+> AI Slop
+
 # cli-transcribe
 
 `cli-transcribe` records audio from a PulseAudio microphone with `ffmpeg`, transcribes it with `whisper-cli`, and prints the transcript.
