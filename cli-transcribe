@@ -10,6 +10,7 @@ DEFAULT_LANG="de"
 lang="$DEFAULT_LANG"
 mic=""
 copy_to_clipboard=false
+agent_mode=false
 verbose=false
 
 log() {
@@ -42,6 +43,7 @@ Options:
   --lang <lang>         Sprache für Whisper, Default: de
                         Beispiele: de, en, fr, auto
   --copy                Transcript nach Erstellung mit wl-copy in die Zwischenablage kopieren.
+  --agent               Transcript mit Kontext für Coding Agents ausgeben/kopieren.
   -v, --verbose         Ausführliche Ausgaben von ffmpeg und whisper-cli anzeigen.
   --list-mics           Verfügbare Mikrofone auflisten. Die ausgegebenen Namen können für --mic genutzt werden.
   -h, --help            Diese Hilfe anzeigen.
@@ -50,6 +52,7 @@ Examples:
   $PROGRAM_NAME
   $PROGRAM_NAME --mic alsa_input.pci-0000_0b_00.4.analog-stereo --lang de
   $PROGRAM_NAME --mic rode --copy
+  $PROGRAM_NAME --copy --agent
   $PROGRAM_NAME --copy
   $PROGRAM_NAME --list-mics
 
@@ -65,6 +68,23 @@ EOF
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1"
+}
+
+format_transcript() {
+  local transcript="$1"
+
+  if [[ "$agent_mode" != true ]]; then
+    printf '%s\n' "$transcript"
+    return 0
+  fi
+
+  cat <<EOF
+Dies ist ein Transkript von einem Menschen, der gerade eine Aufgabe oder Eingabe diktiert hat. Einige Wörter, Namen oder Details können durch die automatische Transkription ungenau sein. Bitte frage nach, wenn etwas unklar ist.
+
+Hier ist das Transkript:
+
+$transcript
+EOF
 }
 
 list_mics() {
@@ -279,6 +299,10 @@ parse_args() {
         copy_to_clipboard=true
         shift
         ;;
+      --agent)
+        agent_mode=true
+        shift
+        ;;
       -v|--verbose)
         verbose=true
         shift
@@ -300,7 +324,7 @@ main() {
     require_command wl-copy
   fi
 
-  local model_path selected_mic work_dir audio_file output_base transcript_file
+  local model_path selected_mic work_dir audio_file output_base transcript_file transcript_output
   model_path="$(ensure_model)"
   selected_mic="$(select_mic)"
   validate_mic "$selected_mic"
@@ -312,13 +336,16 @@ main() {
   log "Temporärer Arbeitsordner: $work_dir"
   record_audio "$selected_mic" "$audio_file"
   transcript_file="$(run_transcription "$model_path" "$audio_file" "$output_base")"
+  transcript_output="$(format_transcript "$(<"$transcript_file")")"
 
   if [[ "$copy_to_clipboard" == true ]]; then
-    wl-copy < "$transcript_file"
+    wl-copy <<< "$transcript_output"
     log "Transcript wurde in die Zwischenablage kopiert."
   fi
 
-  cat "$transcript_file"
+  printf '%s\n' "$transcript_output"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
