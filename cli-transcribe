@@ -9,8 +9,9 @@ DEFAULT_LANG="de"
 
 lang="$DEFAULT_LANG"
 mic=""
+input_file=""
 copy_to_clipboard=false
-agent_mode=false
+explain_prefix=false
 verbose=false
 
 log() {
@@ -40,10 +41,14 @@ Options:
                         Beispiel: --mic "rode" matcht wie *rode*.
                         Wenn mehrere Mikrofone matchen, bricht das Programm mit Erklärung ab.
                         Ohne diese Option wird eine Auswahl mit fzf geöffnet.
+                        Nicht kombinierbar mit --input-file.
+  --input-file <path>   Audio-/Video-Datei transkribieren. Die Datei wird mit ffmpeg
+                        in das benötigte Format (mono 16kHz PCM WAV) konvertiert.
+                        Nicht kombinierbar mit --mic.
   --lang <lang>         Sprache für Whisper, Default: de
                         Beispiele: de, en, fr, auto
   --copy                Transcript nach Erstellung mit wl-copy in die Zwischenablage kopieren.
-  --agent               Transcript mit Kontext für Coding Agents ausgeben/kopieren.
+  --explain-prefix      Transcript mit Kontext für Coding Agents ausgeben/kopieren.
   -v, --verbose         Ausführliche Ausgaben von ffmpeg und whisper-cli anzeigen.
   --list-mics           Verfügbare Mikrofone auflisten. Die ausgegebenen Namen können für --mic genutzt werden.
   -h, --help            Diese Hilfe anzeigen.
@@ -52,16 +57,25 @@ Examples:
   $PROGRAM_NAME
   $PROGRAM_NAME --mic alsa_input.pci-0000_0b_00.4.analog-stereo --lang de
   $PROGRAM_NAME --mic rode --copy
-  $PROGRAM_NAME --copy --agent
+  $PROGRAM_NAME --copy --explain-prefix
   $PROGRAM_NAME --copy
+  $PROGRAM_NAME --input-file ~/Videos/aufnahme.mp4 --lang de
+  $PROGRAM_NAME --input-file ~/Downloads/podcast.mp3 --copy
   $PROGRAM_NAME --list-mics
 
-Ablauf:
+Ablauf (Mikrofon-Modus):
   1. Falls das Whisper-Model fehlt, wird es nach $MODEL_DIR heruntergeladen.
   2. Du wählst ein Mikrofon aus oder gibst es via --mic an.
   3. ffmpeg nimmt auf, bis du Enter/Return drückst.
   4. whisper-cli transkribiert die Aufnahme.
   5. Das Transcript wird auf stdout ausgegeben.
+     Script-Logs werden auf stderr ausgegeben.
+
+Ablauf (--input-file Modus):
+  1. Falls das Whisper-Model fehlt, wird es nach $MODEL_DIR heruntergeladen.
+  2. Die Datei wird mit ffmpeg in mono 16kHz PCM WAV konvertiert.
+  3. whisper-cli transkribiert die Audiodatei.
+  4. Das Transcript wird auf stdout ausgegeben.
      Script-Logs werden auf stderr ausgegeben.
 EOF
 }
@@ -73,7 +87,7 @@ require_command() {
 format_transcript() {
   local transcript="$1"
 
-  if [[ "$agent_mode" != true ]]; then
+  if [[ "$explain_prefix" != true ]]; then
     printf '%s\n' "$transcript"
     return 0
   fi
@@ -163,6 +177,28 @@ select_mic() {
 validate_mic() {
   local selected="$1"
   list_mics | grep -Fx -- "$selected" >/dev/null || die "Mikrofon nicht gefunden: $selected. Nutze --list-mics für gültige Werte."
+}
+
+process_input_file() {
+  local input_path="$1"
+  local output_path="$2"
+
+  [[ -f "$input_path" ]] || die "Datei nicht gefunden: $input_path"
+
+  log "Konvertiere '$input_path' nach mono 16kHz PCM WAV ..."
+
+  local ffmpeg_loglevel="error"
+  if [[ "$verbose" == true ]]; then
+    ffmpeg_loglevel="warning"
+  fi
+
+  ffmpeg -hide_banner -loglevel "$ffmpeg_loglevel" -y \
+    -i "$input_path" \
+    -ac 1 -ar 16000 -c:a pcm_s16le \
+    "$output_path" 2>&1 || die "ffmpeg Konvertierung fehlgeschlagen für: $input_path"
+
+  [[ -s "$output_path" ]] || die "Konvertierte Datei ist leer: $output_path"
+  log "Konvertierung abgeschlossen: $output_path"
 }
 
 record_audio() {
@@ -287,7 +323,14 @@ parse_args() {
         ;;
       --mic)
         [[ $# -ge 2 ]] || die "--mic benötigt einen Wert."
+        [[ -z "$input_file" ]] || die "--mic und --input-file können nicht kombiniert werden."
         mic="$2"
+        shift 2
+        ;;
+      --input-file)
+        [[ $# -ge 2 ]] || die "--input-file benötigt einen Wert."
+        [[ -z "$mic" ]] || die "--mic und --input-file können nicht kombiniert werden."
+        input_file="$2"
         shift 2
         ;;
       --lang)
@@ -299,8 +342,8 @@ parse_args() {
         copy_to_clipboard=true
         shift
         ;;
-      --agent)
-        agent_mode=true
+      --explain-prefix)
+        explain_prefix=true
         shift
         ;;
       -v|--verbose)
@@ -319,22 +362,32 @@ main() {
 
   require_command ffmpeg
   require_command whisper-cli
-  require_command pactl
+
+  if [[ -z "$input_file" ]]; then
+    require_command pactl
+  fi
   if [[ "$copy_to_clipboard" == true ]]; then
     require_command wl-copy
   fi
 
-  local model_path selected_mic work_dir audio_file output_base transcript_file transcript_output
+  local model_path work_dir audio_file output_base transcript_file transcript_output
   model_path="$(ensure_model)"
-  selected_mic="$(select_mic)"
-  validate_mic "$selected_mic"
 
   work_dir="$(mktemp -d -t cli-transcribe.XXXXXX)"
   audio_file="$work_dir/audio.wav"
   output_base="$work_dir/transcript"
 
   log "Temporärer Arbeitsordner: $work_dir"
-  record_audio "$selected_mic" "$audio_file"
+
+  if [[ -n "$input_file" ]]; then
+    process_input_file "$input_file" "$audio_file"
+  else
+    local selected_mic
+    selected_mic="$(select_mic)"
+    validate_mic "$selected_mic"
+    record_audio "$selected_mic" "$audio_file"
+  fi
+
   transcript_file="$(run_transcription "$model_path" "$audio_file" "$output_base")"
   transcript_output="$(format_transcript "$(<"$transcript_file")")"
 

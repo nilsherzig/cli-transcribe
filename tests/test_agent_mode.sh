@@ -9,16 +9,16 @@ fail() {
   exit 1
 }
 
-agent_mode=false
-parse_args --agent
-[[ "$agent_mode" == true ]] || fail "--agent should enable agent mode"
+explain_prefix=false
+parse_args --explain-prefix
+[[ "$explain_prefix" == true ]] || fail "--explain-prefix should enable explain prefix mode"
 
 transcript='Bitte ändere die Login Logik.'
-agent_mode=false
+explain_prefix=false
 default_output="$(format_transcript "$transcript")"
 [[ "$default_output" == "$transcript" ]] || fail "default output should stay unchanged"
 
-agent_mode=true
+explain_prefix=true
 agent_output="$(format_transcript "$transcript")"
-[[ "$agent_output" != "$transcript" ]] || fail "agent output should add context"
-[[ "$agent_output" == *"$transcript"* ]] || fail "agent output should include the transcript"
+[[ "$agent_output" != "$transcript" ]] || fail "explain prefix output should add context"
+[[ "$agent_output" == *"$transcript"* ]] || fail "explain prefix output should include the transcript"

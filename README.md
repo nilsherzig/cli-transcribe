@@ -81,8 +81,8 @@ nix run . -- --copy
 Format transcript for a coding agent:
 
 ```sh
-nix run . -- --agent
-nix run . -- --copy --agent
+nix run . -- --explain-prefix
+nix run . -- --copy --explain-prefix
 ```
 
 Show verbose `ffmpeg` and `whisper-cli` output:
@@ -105,7 +105,7 @@ nix run . -- --help
 4. Press `Enter` / `Return` to stop recording.
 5. Press `Ctrl-C` to abort.
 6. The transcript is printed to `stdout`.
-7. With `--agent`, the printed/copied text includes context for a coding agent.
+7. With `--explain-prefix`, the printed/copied text includes context for a coding agent.
 8. With `--copy`, the transcript is also copied via `wl-copy`.
 
 Audio and transcript files are stored in a temporary folder like:
@@ -123,7 +123,7 @@ Options:
   --mic <pulse-source>  Microphone/PulseAudio source or substring.
   --lang <lang>         Whisper language. Default: de.
   --copy                Copy transcript to clipboard with wl-copy.
-  --agent               Add context around the transcript for coding agents.
+  --explain-prefix      Add context around the transcript for coding agents.
   -v, --verbose         Show verbose ffmpeg and whisper-cli output.
   --list-mics           List available microphones.
   -h, --help            Show help.
