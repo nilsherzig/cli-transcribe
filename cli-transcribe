@@ -84,6 +84,28 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Benötigtes Kommando fehlt: $1"
 }
 
+ffmpeg_loglevel() {
+  if [[ "$verbose" == true ]]; then
+    printf 'warning\n'
+  else
+    printf 'error\n'
+  fi
+}
+
+# Wartet bis $1 (pid) terminiert ist, max. $2 * 100ms.
+# 0 = Prozess beendet, 1 = noch am Leben.
+wait_for_pid_exit() {
+  local pid="$1" max_iters="$2" _
+  for ((_ = 0; _ < max_iters; _++)); do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      wait "$pid" >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 format_transcript() {
   local transcript="$1"
 
@@ -174,11 +196,6 @@ select_mic() {
   printf '%s\n' "$selected"
 }
 
-validate_mic() {
-  local selected="$1"
-  list_mics | grep -Fx -- "$selected" >/dev/null || die "Mikrofon nicht gefunden: $selected. Nutze --list-mics für gültige Werte."
-}
-
 process_input_file() {
   local input_path="$1"
   local output_path="$2"
@@ -187,12 +204,7 @@ process_input_file() {
 
   log "Konvertiere '$input_path' nach mono 16kHz PCM WAV ..."
 
-  local ffmpeg_loglevel="error"
-  if [[ "$verbose" == true ]]; then
-    ffmpeg_loglevel="warning"
-  fi
-
-  ffmpeg -hide_banner -loglevel "$ffmpeg_loglevel" -y \
+  ffmpeg -hide_banner -loglevel "$(ffmpeg_loglevel)" -y \
     -i "$input_path" \
     -ac 1 -ar 16000 -c:a pcm_s16le \
     "$output_path" 2>&1 || die "ffmpeg Konvertierung fehlgeschlagen für: $input_path"
@@ -208,12 +220,7 @@ record_audio() {
   log "Aufnahme startet über Mikrofon: $selected_mic"
   info "Aufnahme läuft. Drücke Enter/Return zum Beenden oder Ctrl-C zum Abbrechen."
 
-  local ffmpeg_loglevel="error"
-  if [[ "$verbose" == true ]]; then
-    ffmpeg_loglevel="warning"
-  fi
-
-  ffmpeg -hide_banner -loglevel "$ffmpeg_loglevel" -y \
+  ffmpeg -hide_banner -loglevel "$(ffmpeg_loglevel)" -y \
     -f pulse -i "$selected_mic" \
     -ac 1 -ar 16000 -c:a pcm_s16le \
     "$audio_file" < /dev/null &
@@ -221,41 +228,21 @@ record_audio() {
   local ffmpeg_pid=$!
 
   stop_recording() {
-    local signal="${1:-INT}"
-    if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
-      wait "$ffmpeg_pid" >/dev/null 2>&1 || true
-      return 0
-    fi
-
-    kill -"$signal" "$ffmpeg_pid" >/dev/null 2>&1 || true
-
-    # Nicht unbegrenzt auf ffmpeg warten: PulseAudio/ffmpeg kann bei SIGINT hängen.
-    for _ in {1..20}; do
+    local first_signal="${1:-INT}"
+    # Eskalation: zuerst $first_signal (z.B. SIGINT), dann SIGTERM, dann SIGKILL.
+    # PulseAudio/ffmpeg kann bei SIGINT hängen, daher mit timeout je Stufe.
+    local -a escalation=("$first_signal:20" "TERM:10" "KILL:10")
+    local step signal iters
+    for step in "${escalation[@]}"; do
+      signal="${step%:*}"
+      iters="${step#*:}"
       if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
         wait "$ffmpeg_pid" >/dev/null 2>&1 || true
         return 0
       fi
-      sleep 0.1
-    done
-
-    log "ffmpeg reagiert nicht auf SIG$signal, sende SIGTERM ..."
-    kill -TERM "$ffmpeg_pid" >/dev/null 2>&1 || true
-    for _ in {1..10}; do
-      if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
-        wait "$ffmpeg_pid" >/dev/null 2>&1 || true
-        return 0
-      fi
-      sleep 0.1
-    done
-
-    log "ffmpeg reagiert nicht auf SIGTERM, sende SIGKILL ..."
-    kill -KILL "$ffmpeg_pid" >/dev/null 2>&1 || true
-    for _ in {1..10}; do
-      if ! kill -0 "$ffmpeg_pid" >/dev/null 2>&1; then
-        wait "$ffmpeg_pid" >/dev/null 2>&1 || true
-        return 0
-      fi
-      sleep 0.1
+      [[ "$signal" == "$first_signal" ]] || log "ffmpeg reagiert nicht, sende SIG$signal ..."
+      kill -"$signal" "$ffmpeg_pid" >/dev/null 2>&1 || true
+      wait_for_pid_exit "$ffmpeg_pid" "$iters" && return 0
     done
   }
 
@@ -285,24 +272,12 @@ run_transcription() {
   local transcript_file="${output_base}.txt"
 
   log "Transkribiere mit whisper-cli, Sprache: $lang"
+  local -a args=(-m "$model_path" -f "$audio_file" -l "$lang" -otxt -of "$output_base" -nt)
   if [[ "$verbose" == true ]]; then
-    whisper-cli \
-      -m "$model_path" \
-      -f "$audio_file" \
-      -l "$lang" \
-      -otxt \
-      --print-colors \
-      --print-confidence \
-      -of "$output_base" \
-      -nt >&2 || die "whisper-cli ist fehlgeschlagen."
+    args+=(--print-colors --print-confidence)
+    whisper-cli "${args[@]}" >&2 || die "whisper-cli ist fehlgeschlagen."
   else
-    whisper-cli \
-      -m "$model_path" \
-      -f "$audio_file" \
-      -l "$lang" \
-      -otxt \
-      -of "$output_base" \
-      -nt >/dev/null 2>&1 || die "whisper-cli ist fehlgeschlagen. Nutze -v für Details."
+    whisper-cli "${args[@]}" >/dev/null 2>&1 || die "whisper-cli ist fehlgeschlagen. Nutze -v für Details."
   fi
 
   [[ -f "$transcript_file" ]] || die "Transcript wurde nicht erstellt: $transcript_file"
@@ -363,9 +338,6 @@ main() {
   require_command ffmpeg
   require_command whisper-cli
 
-  if [[ -z "$input_file" ]]; then
-    require_command pactl
-  fi
   if [[ "$copy_to_clipboard" == true ]]; then
     require_command wl-copy
   fi
@@ -384,7 +356,6 @@ main() {
   else
     local selected_mic
     selected_mic="$(select_mic)"
-    validate_mic "$selected_mic"
     record_audio "$selected_mic" "$audio_file"
   fi
 
