@@ -95,13 +95,14 @@ ffmpeg_loglevel() {
 # Wartet bis $1 (pid) terminiert ist, max. $2 * 100ms.
 # 0 = Prozess beendet, 1 = noch am Leben.
 wait_for_pid_exit() {
-  local pid="$1" max_iters="$2" _
-  for ((_ = 0; _ < max_iters; _++)); do
+  local pid="$1" max_iters="$2" i=0
+  while [[ $i -lt $max_iters ]]; do
     if ! kill -0 "$pid" >/dev/null 2>&1; then
       wait "$pid" >/dev/null 2>&1 || true
       return 0
     fi
     sleep 0.1
+    i=$((i + 1))
   done
   return 1
 }
