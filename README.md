@@ -1,10 +1,11 @@
 > [!WARNING]  
 > AI Slop
-> also there is `whisper-stream` which can do live transcripts, but its kinda broken for me. But might be worth looking into.
 
 # cli-transcribe
 
 `cli-transcribe` records audio from a PulseAudio microphone with `ffmpeg`, transcribes it with `whisper-cli`, and prints the transcript.
+
+It also has a `--live` mode: it records continuously, detects finished speech segments with Silero VAD (`whisper-vad-speech-segments`), and transcribes each segment on the GPU as you speak. This replaces the upstream `whisper-stream`, which re-transcribes an overlapping sliding window (janky output) and offers no clean final transcript.
 
 The default Whisper language is German (`de`). The default model is `large-v3-turbo-q8_0`.
 
@@ -18,17 +19,17 @@ Runtime dependencies are provided by the Nix flake:
 - `whisper-cpp-vulkan`
 - `wl-clipboard` for `--copy`
 
-The model is stored under:
+The `--stop-on-stdin` option is available for integrations that need to stop a
+recording without competing with the terminal's interactive input.
+
+The models are stored under:
 
 ```sh
-$HOME/.local/share/cli-transcribe/ggml-large-v3-turbo-q8_0.bin
+$HOME/.local/share/cli-transcribe/ggml-large-v3-turbo-q8_0.bin   # Whisper
+$HOME/.local/share/cli-transcribe/ggml-silero-v5.1.2.bin         # VAD (live mode)
 ```
 
-If the model is missing, `cli-transcribe` downloads it automatically with:
-
-```sh
-whisper-cpp-download-ggml-model large-v3-turbo-q8_0
-```
+If a model is missing, `cli-transcribe` downloads it automatically. The Whisper model comes from `whisper-cpp-download-ggml-model`; the VAD model is fetched with `curl` from `huggingface.co/ggml-org/whisper-vad`.
 
 ## Usage
 
@@ -48,6 +49,20 @@ Record with interactive microphone selection via `fzf`:
 
 ```sh
 nix run .
+```
+
+Live transcription (prints each finished segment to stderr as you speak, the full transcript to stdout on `Enter`):
+
+```sh
+nix run . -- --live
+nix run . -- --live --mic rode --copy
+```
+
+Tune the VAD with environment variables if segments get dropped or over-split:
+
+```sh
+LIVE_MIN_SILENCE_MS=300 nix run . -- --live   # split on shorter pauses
+LIVE_VAD_THRESHOLD=0.3   nix run . -- --live   # keep quieter speech
 ```
 
 Record with a specific microphone:
@@ -102,7 +117,7 @@ nix run . -- --help
 1. The Whisper model is checked and downloaded if missing.
 2. A microphone is selected via `fzf` or resolved from `--mic`.
 3. Recording starts.
-4. Press `Enter` / `Return` to stop recording.
+4. Press `Enter` / `Return` to stop recording (or use `--stop-on-stdin` for a newline-controlled integration).
 5. Press `Ctrl-C` to abort.
 6. The transcript is printed to `stdout`.
 7. With `--explain-prefix`, the printed/copied text includes context for a coding agent.
@@ -121,6 +136,8 @@ cli-transcribe [OPTIONS]
 
 Options:
   --mic <pulse-source>  Microphone/PulseAudio source or substring.
+  --live                Live mode: transcribe finished speech segments as you speak.
+  --stop-on-stdin       Stop microphone recording when a line is received on stdin.
   --lang <lang>         Whisper language. Default: de.
   --copy                Copy transcript to clipboard with wl-copy.
   --explain-prefix      Add context around the transcript for coding agents.

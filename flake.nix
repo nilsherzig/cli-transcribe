@@ -24,6 +24,7 @@
             runtimeInputs = with pkgs; [
               bash
               coreutils
+              curl
               ffmpeg
               fzf
               gawk
@@ -51,6 +52,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               bash
+              curl
               ffmpeg
               fzf
               pulseaudio

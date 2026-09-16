@@ -44,6 +44,27 @@ if ( parse_args --mic rode --input-file /tmp/test.mp4 ) 2>/dev/null; then
 fi
 pass "--mic und --input-file sind inkompatibel (error)"
 
+# --stop-on-stdin is accepted for microphone integrations.
+stop_on_stdin=false
+input_file=""
+parse_args --stop-on-stdin
+[[ "$stop_on_stdin" == true ]] || fail "--stop-on-stdin sollte stop_on_stdin aktivieren"
+pass "--stop-on-stdin wird akzeptiert"
+
+# --stop-on-stdin cannot be combined with file or live mode.
+stop_on_stdin=false
+input_file=""
+if ( parse_args --stop-on-stdin --input-file /tmp/test.mp4 ) 2>/dev/null; then
+  fail "--stop-on-stdin und --input-file sollten inkompatibel sein"
+fi
+pass "--stop-on-stdin und --input-file sind inkompatibel"
+
+stop_on_stdin=false
+if ( parse_args --stop-on-stdin --live ) 2>/dev/null; then
+  fail "--stop-on-stdin und --live sollten inkompatibel sein"
+fi
+pass "--stop-on-stdin und --live sind inkompatibel"
+
 # --- process_input_file tests (using temp dir) ---
 
 work_dir="$(mktemp -d -t cli-transcribe-test.XXXXXX)"

@@ -7,12 +7,35 @@ MODEL_FILE="ggml-${MODEL_NAME}.bin"
 MODEL_DIR="${HOME}/.local/share/cli-transcribe"
 DEFAULT_LANG="de"
 
+# Silero VAD model used for the live streaming mode. whisper.cpp ships
+# whisper-vad-speech-segments but no download helper, so we fetch it ourselves.
+VAD_MODEL_NAME="silero-v5.1.2"
+VAD_MODEL_FILE="ggml-${VAD_MODEL_NAME}.bin"
+VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/${VAD_MODEL_FILE}"
+
+# Live mode tuning. The VAD knobs are overridable via environment so you can
+# dial them in with your own voice without editing the script:
+#   LIVE_MIN_SILENCE_MS  pause length (ms) that closes a segment.
+#                        Higher = fewer, longer segments but risks dropping
+#                        short speech islands. Lower = more, shorter segments.
+#   LIVE_VAD_THRESHOLD   speech probability cutoff (0.0-1.0). Lower if quiet
+#                        speech gets dropped, raise if noise is picked up.
+LIVE_POLL_SECONDS=1.0   # how often we scan the recording for finished segments
+LIVE_MIN_SILENCE_MS="${LIVE_MIN_SILENCE_MS:-500}"
+LIVE_VAD_THRESHOLD="${LIVE_VAD_THRESHOLD:-0.5}"
+LIVE_PAD_SECONDS=0.15   # padding added around each extracted segment
+
 lang="$DEFAULT_LANG"
 mic=""
 input_file=""
 copy_to_clipboard=false
 explain_prefix=false
 verbose=false
+live=false
+stop_on_stdin=false
+
+# Set by run_live, consumed by main.
+LIVE_TRANSCRIPT=""
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2
@@ -45,6 +68,12 @@ Options:
   --input-file <path>   Audio-/Video-Datei transkribieren. Die Datei wird mit ffmpeg
                         in das benötigte Format (mono 16kHz PCM WAV) konvertiert.
                         Nicht kombinierbar mit --mic.
+  --live                Live-Transkription: nimmt durchgehend auf und transkribiert
+                        jeden an einer Sprechpause abgeschlossenen Abschnitt sofort
+                        (Silero-VAD, GPU). Vorschau läuft auf stderr, der saubere
+                        Gesamttext auf stdout. Nicht kombinierbar mit --input-file.
+  --stop-on-stdin       Im Mikrofon-Modus eine Zeile von stdin zum Beenden lesen,
+                        statt auf Enter in /dev/tty zu warten. Für Integrationen.
   --lang <lang>         Sprache für Whisper, Default: de
                         Beispiele: de, en, fr, auto
   --copy                Transcript nach Erstellung mit wl-copy in die Zwischenablage kopieren.
@@ -55,6 +84,8 @@ Options:
 
 Examples:
   $PROGRAM_NAME
+  $PROGRAM_NAME --live
+  $PROGRAM_NAME --live --mic rode --copy
   $PROGRAM_NAME --mic alsa_input.pci-0000_0b_00.4.analog-stereo --lang de
   $PROGRAM_NAME --mic rode --copy
   $PROGRAM_NAME --copy --explain-prefix
@@ -66,7 +97,7 @@ Examples:
 Ablauf (Mikrofon-Modus):
   1. Falls das Whisper-Model fehlt, wird es nach $MODEL_DIR heruntergeladen.
   2. Du wählst ein Mikrofon aus oder gibst es via --mic an.
-  3. ffmpeg nimmt auf, bis du Enter/Return drückst.
+  3. ffmpeg nimmt auf, bis du Enter/Return drückst (oder bei --stop-on-stdin eine Zeile über stdin kommt).
   4. whisper-cli transkribiert die Aufnahme.
   5. Das Transcript wird auf stdout ausgegeben.
      Script-Logs werden auf stderr ausgegeben.
@@ -77,6 +108,16 @@ Ablauf (--input-file Modus):
   3. whisper-cli transkribiert die Audiodatei.
   4. Das Transcript wird auf stdout ausgegeben.
      Script-Logs werden auf stderr ausgegeben.
+
+Ablauf (--live Modus):
+  1. Falls Whisper- oder VAD-Model fehlen, werden sie nach $MODEL_DIR geladen.
+  2. Du wählst ein Mikrofon aus oder gibst es via --mic an.
+  3. ffmpeg nimmt durchgehend auf (raw PCM).
+  4. In einem Intervall sucht das Silero-VAD abgeschlossene Sprech-Segmente.
+  5. Jedes fertige Segment wird einzeln auf der GPU transkribiert und als
+     Vorschau auf stderr ausgegeben.
+  6. Enter/Return beendet die Aufnahme; das letzte Segment wird finalisiert.
+  7. Der zusammengesetzte Gesamttext wird auf stdout ausgegeben.
 EOF
 }
 
@@ -153,6 +194,28 @@ ensure_model() {
   printf '%s\n' "$model_path"
 }
 
+ensure_vad_model() {
+  local model_path="$MODEL_DIR/$VAD_MODEL_FILE"
+
+  if [[ -f "$model_path" ]]; then
+    log "VAD-Model gefunden: $model_path"
+    printf '%s\n' "$model_path"
+    return 0
+  fi
+
+  require_command curl
+
+  info "VAD-Model fehlt: $model_path"
+  info "Lade VAD-Model '$VAD_MODEL_NAME' herunter ..."
+  mkdir -p "$MODEL_DIR"
+  curl -fSL --progress-bar -o "$model_path" "$VAD_MODEL_URL" >&2 \
+    || die "Download des VAD-Models fehlgeschlagen: $VAD_MODEL_URL"
+
+  [[ -s "$model_path" ]] || die "VAD-Model wurde nicht heruntergeladen: $model_path"
+  info "VAD-Model gespeichert: $model_path"
+  printf '%s\n' "$model_path"
+}
+
 resolve_mic_query() {
   local query="$1"
   local -a exact_matches substring_matches
@@ -219,7 +282,11 @@ record_audio() {
   local audio_file="$2"
 
   log "Aufnahme startet über Mikrofon: $selected_mic"
-  info "Aufnahme läuft. Drücke Enter/Return zum Beenden oder Ctrl-C zum Abbrechen."
+  if [[ "$stop_on_stdin" == true ]]; then
+    info "Aufnahme läuft. Warte auf ein Stop-Signal über stdin oder Ctrl-C zum Abbrechen."
+  else
+    info "Aufnahme läuft. Drücke Enter/Return zum Beenden oder Ctrl-C zum Abbrechen."
+  fi
 
   ffmpeg -hide_banner -loglevel "$(ffmpeg_loglevel)" -y \
     -f pulse -i "$selected_mic" \
@@ -257,7 +324,11 @@ record_audio() {
 
   trap abort_recording INT TERM
 
-  read -r _ < /dev/tty || true
+  if [[ "$stop_on_stdin" == true ]]; then
+    read -r _ || true
+  else
+    read -r _ < /dev/tty || true
+  fi
 
   stop_recording INT
   trap - INT TERM
@@ -286,6 +357,105 @@ run_transcription() {
   printf '%s\n' "$transcript_file"
 }
 
+# Live-Transkription: nimmt durchgehend als raw PCM auf, sucht per Silero-VAD
+# abgeschlossene Sprech-Segmente und transkribiert jedes einzeln auf der GPU.
+# Ergebnis landet in der globalen Variable LIVE_TRANSCRIPT.
+run_live() {
+  local model_path="$1" vad_path="$2" selected_mic="$3" work_dir="$4"
+  local raw_file="$work_dir/audio.raw"
+  local snapshot="$work_dir/snapshot.wav"
+  local -a transcript_parts=()
+  local segments_printed=0
+
+  log "Live-Transkription über Mikrofon: $selected_mic (Sprache: $lang)"
+  info "Live-Transkription läuft. Sprich los; eine kurze Pause schließt ein Segment ab."
+  info "Drücke Enter/Return zum Beenden oder Ctrl-C zum Abbrechen."
+
+  # ffmpeg schreibt headerloses raw PCM. Ein wachsender WAV hätte eine ungültige
+  # Header-Länge, solange ffmpeg läuft; raw PCM lesen wir verlässlich bis EOF.
+  ffmpeg -hide_banner -loglevel "$(ffmpeg_loglevel)" -y \
+    -f pulse -i "$selected_mic" \
+    -ac 1 -ar 16000 -f s16le \
+    "$raw_file" < /dev/null &
+  local ffmpeg_pid=$!
+
+  live_cleanup() {
+    kill -INT "$ffmpeg_pid" >/dev/null 2>&1 || true
+    wait_for_pid_exit "$ffmpeg_pid" 20 || kill -KILL "$ffmpeg_pid" >/dev/null 2>&1 || true
+  }
+
+  abort_live() {
+    trap - INT TERM
+    printf '\n' >&2
+    log "Abbruch angefordert. Stoppe Live-Transkription ..."
+    live_cleanup
+    exit 130
+  }
+  trap abort_live INT TERM
+
+  # Verarbeitet neu abgeschlossene Segmente. $1=true finalisiert auch das letzte
+  # (nur beim Stop), sonst bleibt das letzte Segment offen, da es noch wachsen kann.
+  process_live_segments() {
+    local finalize_last="$1"
+    [[ -s "$raw_file" ]] || return 0
+
+    # Snapshot mit gültigem WAV-Header aus dem bisher aufgenommenen raw PCM bauen.
+    ffmpeg -hide_banner -loglevel error -y \
+      -f s16le -ar 16000 -ac 1 -i "$raw_file" -c:a pcm_s16le "$snapshot" 2>/dev/null || return 0
+
+    # Mit =() initialisieren: unter set -u gilt ein nur deklariertes Array sonst
+    # als "unset" und ${#starts[@]} würde fehlschlagen, wenn kein Segment kommt.
+    local starts=() ends=()
+    local line
+    while IFS= read -r line; do
+      # Format: "Speech segment N: start = A, end = B" (Werte in Centisekunden).
+      [[ "$line" =~ start\ =\ ([0-9.]+),\ end\ =\ ([0-9.]+) ]] || continue
+      starts+=("${BASH_REMATCH[1]}")
+      ends+=("${BASH_REMATCH[2]}")
+    done < <(whisper-vad-speech-segments -f "$snapshot" -vm "$vad_path" \
+               -vsd "$LIVE_MIN_SILENCE_MS" -vt "$LIVE_VAD_THRESHOLD" --no-prints 2>/dev/null)
+
+    local total=${#starts[@]}
+    local limit=$total
+    [[ "$finalize_last" == true ]] || limit=$((total - 1))
+
+    local i start_s end_s seg text
+    for (( i = segments_printed; i < limit; i++ )); do
+      start_s=$(awk "BEGIN{v=${starts[i]}/100-${LIVE_PAD_SECONDS}; if(v<0)v=0; printf \"%.2f\", v}")
+      end_s=$(awk "BEGIN{printf \"%.2f\", ${ends[i]}/100+${LIVE_PAD_SECONDS}}")
+      seg="$work_dir/seg.wav"
+      if ffmpeg -hide_banner -loglevel error -y -i "$snapshot" -ss "$start_s" -to "$end_s" "$seg" 2>/dev/null; then
+        text="$(whisper-cli -m "$model_path" -f "$seg" -l "$lang" -nt -np 2>/dev/null \
+                  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [[ -n "$text" ]]; then
+          info "  » $text"
+          transcript_parts+=("$text")
+        fi
+      fi
+      rm -f "$seg"
+      segments_printed=$((i + 1))
+    done
+  }
+
+  # read -t dient gleichzeitig als Poll-Intervall und als Enter-Erkennung.
+  while kill -0 "$ffmpeg_pid" >/dev/null 2>&1; do
+    process_live_segments false
+    if read -r -t "$LIVE_POLL_SECONDS" _ < /dev/tty; then
+      break
+    fi
+  done
+
+  trap - INT TERM
+  log "Stoppe Aufnahme, finalisiere Transkript ..."
+  live_cleanup
+  process_live_segments true
+
+  [[ ${#transcript_parts[@]} -gt 0 ]] || die "Keine Sprache erkannt. Nichts zu transkribieren."
+
+  local IFS=' '
+  LIVE_TRANSCRIPT="${transcript_parts[*]}"
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -306,8 +476,22 @@ parse_args() {
       --input-file)
         [[ $# -ge 2 ]] || die "--input-file benötigt einen Wert."
         [[ -z "$mic" ]] || die "--mic und --input-file können nicht kombiniert werden."
+        [[ "$live" != true ]] || die "--live und --input-file können nicht kombiniert werden."
+        [[ "$stop_on_stdin" != true ]] || die "--input-file und --stop-on-stdin können nicht kombiniert werden."
         input_file="$2"
         shift 2
+        ;;
+      --live)
+        [[ -z "$input_file" ]] || die "--live und --input-file können nicht kombiniert werden."
+        [[ "$stop_on_stdin" != true ]] || die "--live und --stop-on-stdin können nicht kombiniert werden."
+        live=true
+        shift
+        ;;
+      --stop-on-stdin)
+        [[ -z "$input_file" ]] || die "--input-file und --stop-on-stdin können nicht kombiniert werden."
+        [[ "$live" != true ]] || die "--live und --stop-on-stdin können nicht kombiniert werden."
+        stop_on_stdin=true
+        shift
         ;;
       --lang)
         [[ $# -ge 2 ]] || die "--lang benötigt einen Wert."
@@ -339,11 +523,15 @@ main() {
   require_command ffmpeg
   require_command whisper-cli
 
+  if [[ "$live" == true ]]; then
+    require_command whisper-vad-speech-segments
+  fi
+
   if [[ "$copy_to_clipboard" == true ]]; then
     require_command wl-copy
   fi
 
-  local model_path work_dir audio_file output_base transcript_file transcript_output
+  local model_path vad_path work_dir audio_file output_base transcript_file transcript_output selected_mic
   model_path="$(ensure_model)"
 
   work_dir="$(mktemp -d -t cli-transcribe.XXXXXX)"
@@ -352,16 +540,22 @@ main() {
 
   log "Temporärer Arbeitsordner: $work_dir"
 
-  if [[ -n "$input_file" ]]; then
-    process_input_file "$input_file" "$audio_file"
-  else
-    local selected_mic
+  if [[ "$live" == true ]]; then
+    vad_path="$(ensure_vad_model)"
     selected_mic="$(select_mic)"
-    record_audio "$selected_mic" "$audio_file"
-  fi
+    run_live "$model_path" "$vad_path" "$selected_mic" "$work_dir"
+    transcript_output="$(format_transcript "$LIVE_TRANSCRIPT")"
+  else
+    if [[ -n "$input_file" ]]; then
+      process_input_file "$input_file" "$audio_file"
+    else
+      selected_mic="$(select_mic)"
+      record_audio "$selected_mic" "$audio_file"
+    fi
 
-  transcript_file="$(run_transcription "$model_path" "$audio_file" "$output_base")"
-  transcript_output="$(format_transcript "$(<"$transcript_file")")"
+    transcript_file="$(run_transcription "$model_path" "$audio_file" "$output_base")"
+    transcript_output="$(format_transcript "$(<"$transcript_file")")"
+  fi
 
   if [[ "$copy_to_clipboard" == true ]]; then
     wl-copy <<< "$transcript_output"
