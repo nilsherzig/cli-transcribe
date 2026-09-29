@@ -10,6 +10,8 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
@@ -29,10 +31,13 @@
               fzf
               gawk
               gnugrep
+            ] ++ (if stdenv.hostPlatform.isDarwin then [
+              whisper-cpp
+            ] else [
               pulseaudio
               whisper-cpp-vulkan
               wl-clipboard
-            ];
+            ]);
             text = builtins.readFile ./cli-transcribe;
           };
         });
@@ -55,10 +60,13 @@
               curl
               ffmpeg
               fzf
+            ] ++ (if stdenv.hostPlatform.isDarwin then [
+              whisper-cpp
+            ] else [
               pulseaudio
               whisper-cpp-vulkan
               wl-clipboard
-            ];
+            ]);
           };
         });
     };

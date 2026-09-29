@@ -36,6 +36,7 @@ stop_on_stdin=false
 
 # Set by run_live, consumed by main.
 LIVE_TRANSCRIPT=""
+AUDIO_CAPTURE_ARGS=()
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2
@@ -60,7 +61,7 @@ Usage:
   $PROGRAM_NAME help
 
 Options:
-  --mic <pulse-source>  Mikrofon/PulseAudio-Source direkt oder als Teilstring angeben.
+  --mic <device>        Mikrofon direkt oder als Teilstring angeben.
                         Beispiel: --mic "rode" matcht wie *rode*.
                         Wenn mehrere Mikrofone matchen, bricht das Programm mit Erklärung ab.
                         Ohne diese Option wird eine Auswahl mit fzf geöffnet.
@@ -70,13 +71,13 @@ Options:
                         Nicht kombinierbar mit --mic.
   --live                Live-Transkription: nimmt durchgehend auf und transkribiert
                         jeden an einer Sprechpause abgeschlossenen Abschnitt sofort
-                        (Silero-VAD, GPU). Vorschau läuft auf stderr, der saubere
+                        (Silero-VAD). Vorschau läuft auf stderr, der saubere
                         Gesamttext auf stdout. Nicht kombinierbar mit --input-file.
   --stop-on-stdin       Im Mikrofon-Modus eine Zeile von stdin zum Beenden lesen,
                         statt auf Enter in /dev/tty zu warten. Für Integrationen.
   --lang <lang>         Sprache für Whisper, Default: de
                         Beispiele: de, en, fr, auto
-  --copy                Transcript nach Erstellung mit wl-copy in die Zwischenablage kopieren.
+  --copy                Transcript nach Erstellung in die Zwischenablage kopieren.
   --explain-prefix      Transcript mit Kontext für Coding Agents ausgeben/kopieren.
   -v, --verbose         Ausführliche Ausgaben von ffmpeg und whisper-cli anzeigen.
   --list-mics           Verfügbare Mikrofone auflisten. Die ausgegebenen Namen können für --mic genutzt werden.
@@ -114,7 +115,7 @@ Ablauf (--live Modus):
   2. Du wählst ein Mikrofon aus oder gibst es via --mic an.
   3. ffmpeg nimmt durchgehend auf (raw PCM).
   4. In einem Intervall sucht das Silero-VAD abgeschlossene Sprech-Segmente.
-  5. Jedes fertige Segment wird einzeln auf der GPU transkribiert und als
+  5. Jedes fertige Segment wird einzeln transkribiert und als
      Vorschau auf stderr ausgegeben.
   6. Enter/Return beendet die Aufnahme; das letzte Segment wird finalisiert.
   7. Der zusammengesetzte Gesamttext wird auf stdout ausgegeben.
@@ -165,9 +166,39 @@ $transcript
 EOF
 }
 
+is_macos() {
+  [[ "$(uname -s)" == Darwin ]]
+}
+
 list_mics() {
-  require_command pactl
-  pactl list short sources | awk '$2 !~ /\.monitor$/ { print $2 }'
+  if is_macos; then
+    require_command ffmpeg
+    # AVFoundation lists video devices first; its audio indices are independent.
+    # ffmpeg exits non-zero after listing because no input was opened.
+    local line audio_devices=false
+    while IFS= read -r line; do
+      if [[ "$line" == *"AVFoundation audio devices:"* ]]; then
+        audio_devices=true
+        continue
+      fi
+      if [[ "$audio_devices" == true && "$line" =~ \[([0-9]+)\]\ (.+)$ ]]; then
+        printf ':%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+      fi
+    done < <(ffmpeg -hide_banner -f avfoundation -list_devices true -i '' 2>&1 || true)
+  else
+    require_command pactl
+    pactl list short sources | awk '$2 !~ /\.monitor$/ { print $2 }'
+  fi
+}
+
+# Set the input arguments for both the regular and live recording paths.
+set_audio_capture_args() {
+  local selected_mic="$1"
+  if is_macos; then
+    AUDIO_CAPTURE_ARGS=(-f avfoundation -i "${selected_mic%% *}")
+  else
+    AUDIO_CAPTURE_ARGS=(-f pulse -i "$selected_mic")
+  fi
 }
 
 ensure_model() {
@@ -288,8 +319,9 @@ record_audio() {
     info "Aufnahme läuft. Drücke Enter/Return zum Beenden oder Ctrl-C zum Abbrechen."
   fi
 
+  set_audio_capture_args "$selected_mic"
   ffmpeg -hide_banner -loglevel "$(ffmpeg_loglevel)" -y \
-    -f pulse -i "$selected_mic" \
+    "${AUDIO_CAPTURE_ARGS[@]}" \
     -ac 1 -ar 16000 -c:a pcm_s16le \
     "$audio_file" < /dev/null &
 
@@ -358,7 +390,7 @@ run_transcription() {
 }
 
 # Live-Transkription: nimmt durchgehend als raw PCM auf, sucht per Silero-VAD
-# abgeschlossene Sprech-Segmente und transkribiert jedes einzeln auf der GPU.
+# abgeschlossene Sprech-Segmente und transkribiert jedes einzeln.
 # Ergebnis landet in der globalen Variable LIVE_TRANSCRIPT.
 run_live() {
   local model_path="$1" vad_path="$2" selected_mic="$3" work_dir="$4"
@@ -373,8 +405,9 @@ run_live() {
 
   # ffmpeg schreibt headerloses raw PCM. Ein wachsender WAV hätte eine ungültige
   # Header-Länge, solange ffmpeg läuft; raw PCM lesen wir verlässlich bis EOF.
+  set_audio_capture_args "$selected_mic"
   ffmpeg -hide_banner -loglevel "$(ffmpeg_loglevel)" -y \
-    -f pulse -i "$selected_mic" \
+    "${AUDIO_CAPTURE_ARGS[@]}" \
     -ac 1 -ar 16000 -f s16le \
     "$raw_file" < /dev/null &
   local ffmpeg_pid=$!
@@ -528,7 +561,11 @@ main() {
   fi
 
   if [[ "$copy_to_clipboard" == true ]]; then
-    require_command wl-copy
+    if is_macos; then
+      require_command pbcopy
+    else
+      require_command wl-copy
+    fi
   fi
 
   local model_path vad_path work_dir audio_file output_base transcript_file transcript_output selected_mic
@@ -558,7 +595,11 @@ main() {
   fi
 
   if [[ "$copy_to_clipboard" == true ]]; then
-    wl-copy <<< "$transcript_output"
+    if is_macos; then
+      printf '%s' "$transcript_output" | pbcopy
+    else
+      wl-copy <<< "$transcript_output"
+    fi
     log "Transcript wurde in die Zwischenablage kopiert."
   fi
 
