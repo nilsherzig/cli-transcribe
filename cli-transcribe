@@ -251,6 +251,12 @@ resolve_mic_query() {
   local query="$1"
   local -a exact_matches substring_matches
 
+  # AVFoundation accepts :N directly; listing devices is slow on macOS.
+  if is_macos && [[ "$query" =~ ^:[0-9]+$ ]]; then
+    printf '%s\n' "$query"
+    return 0
+  fi
+
   mapfile -t exact_matches < <(list_mics | grep -Fxi -- "$query" || true)
   if [[ ${#exact_matches[@]} -eq 1 ]]; then
     printf '%s\n' "${exact_matches[0]}"
@@ -356,11 +362,26 @@ record_audio() {
 
   trap abort_recording INT TERM
 
-  if [[ "$stop_on_stdin" == true ]]; then
-    read -r _ || true
-  else
-    read -r _ < /dev/tty || true
-  fi
+  # Also notice early capture failures (e.g. an invalid AVFoundation index)
+  # instead of waiting forever for Enter on a recording that never started.
+  local read_status
+  while kill -0 "$ffmpeg_pid" >/dev/null 2>&1; do
+    if [[ "$stop_on_stdin" == true ]]; then
+      if read -r -t 0.1 _; then
+        break
+      else
+        read_status=$?
+      fi
+    else
+      if read -r -t 0.1 _ < /dev/tty; then
+        break
+      else
+        read_status=$?
+      fi
+    fi
+    # read returns >128 on timeout; EOF should stop the recording as before.
+    [[ "$read_status" -gt 128 ]] || break
+  done
 
   stop_recording INT
   trap - INT TERM

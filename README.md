@@ -77,7 +77,7 @@ You can also use a case-insensitive substring:
 nix run . -- --mic rode
 ```
 
-This matches as if `*rode*` was used. If multiple microphones match, the program exits with an explanation and prints the matching devices. On macOS, `--list-mics` prints the AVFoundation audio index and name (for example, `:0 MacBook Air Microphone`); either the index (`--mic ':0'`) or a unique part of the name can be used.
+This matches as if `*rode*` was used. If multiple microphones match, the program exits with an explanation and prints the matching devices. On macOS, `--list-mics` prints the AVFoundation audio index and name (for example, `:0 MacBook Air Microphone`); either the index (`--mic ':0'`) or a unique part of the name can be used. Passing an index skips device enumeration for faster startup.
 
 Set language:
 

@@ -28,8 +28,13 @@ result="$(list_mics)"
   || fail "AVFoundation audio devices should exclude video devices, got: $result"
 [[ "$(resolve_mic_query 'usb')" == ':1 USB Microphone' ]] \
   || fail 'Microphone name should resolve to its AVFoundation index'
-[[ "$(resolve_mic_query ':0')" == ':0 MacBook Air Microphone' ]] \
-  || fail 'AVFoundation index should resolve to a microphone'
+# A numeric AVFoundation index goes straight to ffmpeg without enumerating devices.
+list_mics() { fail 'Explicit AVFoundation index must not list devices'; }
+[[ "$(resolve_mic_query ':0')" == ':0' ]] \
+  || fail 'AVFoundation index should pass through directly'
+set_audio_capture_args ':0'
+[[ "${AUDIO_CAPTURE_ARGS[*]}" == '-f avfoundation -i :0' ]] \
+  || fail "Unexpected direct macOS capture arguments: ${AUDIO_CAPTURE_ARGS[*]}"
 set_audio_capture_args ':1 USB Microphone'
 [[ "${AUDIO_CAPTURE_ARGS[*]}" == '-f avfoundation -i :1' ]] \
   || fail "Unexpected macOS capture arguments: ${AUDIO_CAPTURE_ARGS[*]}"
