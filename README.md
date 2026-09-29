@@ -3,7 +3,7 @@
 
 # cli-transcribe
 
-`cli-transcribe` records audio with `ffmpeg` (PulseAudio on Linux, AVFoundation on macOS), transcribes it with `whisper-cli`, and prints the transcript.
+`cli-transcribe` records audio with `ffmpeg` (PulseAudio on Linux, AVFoundation on macOS) and prints the transcript. In microphone mode, it starts a local `whisper-server` alongside the recording so the model can load while you speak. The server is stopped after transcription or on abort. File input and live mode use `whisper-cli`.
 
 It also has a `--live` mode: it records continuously, detects finished speech segments with Silero VAD (`whisper-vad-speech-segments`), and transcribes each segment as you speak. This replaces the upstream `whisper-stream`, which re-transcribes an overlapping sliding window (janky output) and offers no clean final transcript.
 
@@ -114,14 +114,13 @@ nix run . -- --help
 
 ## Recording flow
 
-1. The Whisper model is checked and downloaded if missing.
-2. A microphone is selected via `fzf` or resolved from `--mic`.
-3. Recording starts.
-4. Press `Enter` / `Return` to stop recording (or use `--stop-on-stdin` for a newline-controlled integration).
-5. Press `Ctrl-C` to abort.
-6. The transcript is printed to `stdout`.
-7. With `--explain-prefix`, the printed/copied text includes context for a coding agent.
-8. With `--copy`, the transcript is also copied via `wl-copy` (Linux) or `pbcopy` (macOS).
+1. A microphone is selected via `fzf` or resolved from `--mic`.
+2. Recording and a loopback-only Whisper server start in parallel. If the model is missing, it is downloaded while recording.
+3. Press `Enter` / `Return` to stop recording (or use `--stop-on-stdin` for a newline-controlled integration).
+4. Once the server is ready, the recording is transcribed and the server is stopped. Press `Ctrl-C` to abort and stop both processes.
+5. The transcript is printed to `stdout`.
+6. With `--explain-prefix`, the printed/copied text includes context for a coding agent.
+7. With `--copy`, the transcript is also copied via `wl-copy` (Linux) or `pbcopy` (macOS).
 
 Audio and transcript files are stored in a temporary folder like:
 

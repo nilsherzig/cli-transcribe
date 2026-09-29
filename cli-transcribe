@@ -37,6 +37,10 @@ stop_on_stdin=false
 # Set by run_live, consumed by main.
 LIVE_TRANSCRIPT=""
 AUDIO_CAPTURE_ARGS=()
+RECORDING_SERVER_PID=""
+RECORDING_SERVER_PORT=""
+RECORDING_SERVER_PATH=""
+RECORDING_SERVER_LOG=""
 
 log() {
   printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >&2
@@ -96,10 +100,10 @@ Examples:
   $PROGRAM_NAME --list-mics
 
 Ablauf (Mikrofon-Modus):
-  1. Falls das Whisper-Model fehlt, wird es nach $MODEL_DIR heruntergeladen.
-  2. Du wählst ein Mikrofon aus oder gibst es via --mic an.
-  3. ffmpeg nimmt auf, bis du Enter/Return drückst (oder bei --stop-on-stdin eine Zeile über stdin kommt).
-  4. whisper-cli transkribiert die Aufnahme.
+  1. Du wählst ein Mikrofon aus oder gibst es via --mic an.
+  2. ffmpeg nimmt auf; parallel lädt ein lokaler Whisper-Server das Model.
+  3. Enter/Return beendet die Aufnahme (oder eine Zeile über stdin bei --stop-on-stdin).
+  4. Der Whisper-Server transkribiert die Aufnahme und wird danach beendet.
   5. Das Transcript wird auf stdout ausgegeben.
      Script-Logs werden auf stderr ausgegeben.
 
@@ -390,6 +394,64 @@ record_audio() {
   log "Aufnahme gespeichert: $audio_file"
 }
 
+# Load the model concurrently with recording. The private path distinguishes
+# this server from any other process listening on the same port.
+start_recording_server() {
+  local work_dir="$1" model_path
+  RECORDING_SERVER_PORT=$((49152 + ((RANDOM << 15 | RANDOM) % 16384)))
+  RECORDING_SERVER_PATH="/${work_dir##*/}"
+  RECORDING_SERVER_LOG="$work_dir/whisper-server.log"
+  (
+    model_path="$(ensure_model)"
+    exec whisper-server -m "$model_path" -l "$lang" \
+      --host 127.0.0.1 --port "$RECORDING_SERVER_PORT" \
+      --request-path "$RECORDING_SERVER_PATH" > "$RECORDING_SERVER_LOG" 2>&1
+  ) &
+  RECORDING_SERVER_PID=$!
+}
+
+stop_recording_server() {
+  [[ -n "$RECORDING_SERVER_PID" ]] || return 0
+  kill -TERM "$RECORDING_SERVER_PID" 2>/dev/null || true
+  if ! wait_for_pid_exit "$RECORDING_SERVER_PID" 30; then
+    kill -KILL "$RECORDING_SERVER_PID" 2>/dev/null || true
+    wait "$RECORDING_SERVER_PID" 2>/dev/null || true
+  fi
+  RECORDING_SERVER_PID=""
+}
+
+wait_for_recording_server() {
+  local url="http://127.0.0.1:$RECORDING_SERVER_PORT$RECORDING_SERVER_PATH/health"
+  local i
+  for ((i=0; i<3000; i++)); do
+    if ! kill -0 "$RECORDING_SERVER_PID" 2>/dev/null; then
+      die "Whisper-Server wurde nicht gestartet. Details: $RECORDING_SERVER_LOG"
+    fi
+    if curl --noproxy '*' -fsS --connect-timeout 1 --max-time 1 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  die "Whisper-Server wurde nicht rechtzeitig bereit. Details: $RECORDING_SERVER_LOG"
+}
+
+run_server_transcription() {
+  local audio_file="$1" output_base="$2"
+  local transcript_file="${output_base}.txt"
+  wait_for_recording_server
+  log "Transkribiere mit vorbereitetem Whisper-Server, Sprache: $lang"
+  if ! curl --noproxy '*' -fsS --max-time 600 \
+    -F "file=@${audio_file};type=audio/wav" \
+    -F "language=$lang" -F response_format=text -F no_timestamps=true \
+    "http://127.0.0.1:$RECORDING_SERVER_PORT$RECORDING_SERVER_PATH/inference" \
+    > "$transcript_file"; then
+    die "Whisper-Server ist fehlgeschlagen. Details: $RECORDING_SERVER_LOG"
+  fi
+  [[ -f "$transcript_file" ]] || die "Transcript wurde nicht erstellt: $transcript_file"
+  log "Transcript gespeichert: $transcript_file"
+  printf '%s\n' "$transcript_file"
+}
+
 run_transcription() {
   local model_path="$1"
   local audio_file="$2"
@@ -575,7 +637,12 @@ main() {
   parse_args "$@"
 
   require_command ffmpeg
-  require_command whisper-cli
+  if [[ -z "$input_file" && "$live" != true ]]; then
+    require_command whisper-server
+    require_command curl
+  else
+    require_command whisper-cli
+  fi
 
   if [[ "$live" == true ]]; then
     require_command whisper-vad-speech-segments
@@ -590,8 +657,6 @@ main() {
   fi
 
   local model_path vad_path work_dir audio_file output_base transcript_file transcript_output selected_mic
-  model_path="$(ensure_model)"
-
   work_dir="$(mktemp -d -t cli-transcribe.XXXXXX)"
   audio_file="$work_dir/audio.wav"
   output_base="$work_dir/transcript"
@@ -599,19 +664,27 @@ main() {
   log "Temporärer Arbeitsordner: $work_dir"
 
   if [[ "$live" == true ]]; then
+    model_path="$(ensure_model)"
     vad_path="$(ensure_vad_model)"
     selected_mic="$(select_mic)"
     run_live "$model_path" "$vad_path" "$selected_mic" "$work_dir"
     transcript_output="$(format_transcript "$LIVE_TRANSCRIPT")"
-  else
-    if [[ -n "$input_file" ]]; then
-      process_input_file "$input_file" "$audio_file"
-    else
-      selected_mic="$(select_mic)"
-      record_audio "$selected_mic" "$audio_file"
-    fi
-
+  elif [[ -n "$input_file" ]]; then
+    model_path="$(ensure_model)"
+    process_input_file "$input_file" "$audio_file"
     transcript_file="$(run_transcription "$model_path" "$audio_file" "$output_base")"
+    transcript_output="$(format_transcript "$(<"$transcript_file")")"
+  else
+    selected_mic="$(select_mic)"
+    start_recording_server "$work_dir"
+    trap stop_recording_server EXIT
+    record_audio "$selected_mic" "$audio_file"
+    transcript_file="$(run_server_transcription "$audio_file" "$output_base")"
+    stop_recording_server
+    if [[ "$verbose" == true ]]; then
+      cat "$RECORDING_SERVER_LOG" >&2
+    fi
+    trap - EXIT
     transcript_output="$(format_transcript "$(<"$transcript_file")")"
   fi
 
